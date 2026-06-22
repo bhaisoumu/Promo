@@ -1,0 +1,5 @@
+telethon==1.28.5
+python-dotenv==1.0.0
+pymongo==4.5.0
+motor==3.3.2
+asyncio==3.4.3
