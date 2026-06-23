@@ -1,7 +1,7 @@
 from telethon import TelegramClient, events
 from telethon.tl.types import User, Chat, Channel
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.functions.folders import ImportFolderInviteRequest   # <-- NEW IMPORT
+from telethon.tl.functions.folders import ImportFolderInviteRequest
 from telethon.errors import FloodWaitError, InviteHashInvalidError, InviteHashExpiredError
 import asyncio
 import time
@@ -32,14 +32,13 @@ def log_exception(loop, context):
     exception = context.get('exception')
     if exception:
         error_text = f"Exception: {exception}\n{traceback.format_exc()}"
-        asyncio.create_task(send_log(error_text))
+        try:
+            asyncio.ensure_future(send_log(error_text))
+        except Exception:
+            pass
         print(error_text)
     else:
         print(context['message'])
-
-# Set up global exception handler
-loop = asyncio.get_event_loop()
-loop.set_exception_handler(log_exception)
 
 # --- HELPERS ---
 def credit(text: str) -> str:
@@ -49,6 +48,7 @@ def is_authorized(user_id: int) -> bool:
     return user_id == config.OWNER_ID or user_id in config.SUDO_USERS
 
 def is_group(chat) -> bool:
+    """Only returns True for groups (supergroups / basic groups), not channels or users."""
     if isinstance(chat, User):
         return False
     if hasattr(chat, 'megagroup') and chat.megagroup:
@@ -284,6 +284,11 @@ async def spam_send(event):
 #               BROADCAST (only groups)
 # ============================================================
 async def broadcast_message(reply_msg):
+    """
+    Broadcast the given message to all groups.
+    reply_msg must be a single message object (not a list).
+    Returns a formatted report string or None.
+    """
     groups = []
     async for dialog in client.iter_dialogs():
         if dialog.is_group or (hasattr(dialog.entity, 'megagroup') and dialog.entity.megagroup):
@@ -301,6 +306,17 @@ async def broadcast_message(reply_msg):
         try:
             await client.send_message(chat, reply_msg)
             return True
+        except FloodWaitError as fw:
+            # Auto wait for flood control
+            wait = fw.seconds + 2
+            await asyncio.sleep(wait)
+            # Retry once
+            try:
+                await client.send_message(chat, reply_msg)
+                return True
+            except Exception as e2:
+                failed.append((chat.title or chat.id, f"Flood/Retry fail: {e2}"))
+                return False
         except Exception as e:
             failed.append((chat.title or chat.id, str(e)))
             return False
@@ -363,10 +379,17 @@ async def auto_broadcast_loop():
             settings = await database.get_auto_broadcast()
             if not settings or not settings.get("active", False):
                 break
-            msg = await client.get_messages(settings["chat_id"], ids=settings["message_id"])
+            # FIXED: get_messages returns a list, take the first one
+            msgs = await client.get_messages(settings["chat_id"], ids=settings["message_id"])
+            msg = msgs[0] if msgs else None
             if msg:
                 report = await broadcast_message(msg)
-                print(f"Auto broadcast sent: {report}")
+                if report:
+                    print(f"Auto broadcast sent: {report}")
+                else:
+                    print("Auto broadcast: no groups found.")
+            else:
+                print("Auto broadcast: original message not found.")
             await asyncio.sleep(config.AUTO_BROADCAST_INTERVAL)
         except asyncio.CancelledError:
             break
@@ -670,6 +693,9 @@ async def main():
     MODE = config.DEFAULT_MODE
     await client.start(phone=config.PHONE)
     client.start_time = time.time()
+    # Ensure AUTO_BROADCAST_ACTIVE is initialised
+    if not hasattr(config, 'AUTO_BROADCAST_ACTIVE'):
+        config.AUTO_BROADCAST_ACTIVE = False
     print("✅ Userbot Started — @DhruvOrigin")
     print(f"📊 Mode: {MODE}, Delay: {DELAY}s")
     print(f"👥 Sudo: {len(config.SUDO_USERS)}")
