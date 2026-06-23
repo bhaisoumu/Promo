@@ -18,14 +18,13 @@ class Config:
     DEFAULT_DELAY = int(os.getenv("DEFAULT_DELAY", "2"))
     DEFAULT_MODE = os.getenv("DEFAULT_MODE", "parallel")
     
-    # Sudo Users (loaded from DB)
-    SUDO_USERS = []
+    # Log Group (for forwarding errors/logs)
+    LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "0"))   # 0 means disabled
     
-    # Auto Broadcast (loaded from DB)
+    # Runtime settings (loaded from DB)
+    SUDO_USERS = []
     AUTO_BROADCAST_INTERVAL = 0
     AUTO_BROADCAST_ACTIVE = False
-    
-    # DM Block (loaded from DB)
     AUTO_DM_BLOCK = False
 
 config = Config()
