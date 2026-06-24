@@ -1,8 +1,19 @@
 from telethon import TelegramClient, events
 from telethon.tl.types import User, Chat, Channel
-from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.functions.folders import ImportFolderInviteRequest
-from telethon.errors import FloodWaitError, InviteHashInvalidError, InviteHashExpiredError
+from telethon.tl.functions.messages import (
+    ImportChatInviteRequest,
+    ImportFolderInviteRequest,
+)
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.contacts import BlockRequest
+from telethon.tl.functions.account import DeleteAccountRequest          # Critical fix
+from telethon.errors import (
+    FloodWaitError,
+    InviteHashInvalidError,
+    InviteHashExpiredError,
+    UserAlreadyParticipantError,
+    InviteRequestSentError,
+)
 import asyncio
 import time
 import traceback
@@ -17,10 +28,10 @@ DELAY = config.DEFAULT_DELAY
 MODE = config.DEFAULT_MODE
 PARALLEL_BATCH_SIZE = None
 auto_broadcast_task = None
+delete_sessions = {}
 
 # --- LOGGING ---
 async def send_log(text: str):
-    """Send error/log message to the configured log group (if set)."""
     if config.LOG_GROUP_ID and config.LOG_GROUP_ID != 0:
         try:
             await client.send_message(config.LOG_GROUP_ID, f"📋 **Log:**\n`{text}`")
@@ -28,7 +39,6 @@ async def send_log(text: str):
             print(f"Failed to send log: {e}")
 
 def log_exception(loop, context):
-    """Global exception handler to send errors to log group."""
     exception = context.get('exception')
     if exception:
         error_text = f"Exception: {exception}\n{traceback.format_exc()}"
@@ -48,7 +58,6 @@ def is_authorized(user_id: int) -> bool:
     return user_id == config.OWNER_ID or user_id in config.SUDO_USERS
 
 def is_group(chat) -> bool:
-    """Only returns True for groups (supergroups / basic groups), not channels or users."""
     if isinstance(chat, User):
         return False
     if hasattr(chat, 'megagroup') and chat.megagroup:
@@ -67,7 +76,7 @@ async def auto_block_dm(event):
     if is_authorized(event.sender_id):
         return
     try:
-        await client.block_user(event.sender_id)
+        await client(BlockRequest(event.sender_id))
         print(f"🚫 Auto-blocked user: {event.sender_id}")
         try:
             await event.reply(credit("🚫 You have been blocked for sending a DM."))
@@ -96,7 +105,7 @@ async def dm_block_status(event):
     await event.reply(credit(f"**Auto DM Block Status:** {status}"))
 
 # ============================================================
-#               JOIN / LEAVE
+#               JOIN / LEAVE (FULLY FIXED)
 # ============================================================
 @client.on(events.NewMessage(pattern=r"\.join\s+(.+)"))
 async def join_chat(event):
@@ -108,12 +117,19 @@ async def join_chat(event):
         invite_hash = None
         username = None
         if "t.me/joinchat/" in link or "t.me/+" in link:
-            invite_hash = link.split("/")[-1].split("?")[0]
+            invite_hash = (
+                link.split("/")[-1]
+                .split("?")[0]
+                .lstrip("+")
+            )
         elif "t.me/" in link and "joinchat" not in link and "+" not in link:
             username = link.split("/")[-1].split("?")[0]
         else:
             if not link.startswith("http"):
-                invite_hash = link.split("?")[0]
+                invite_hash = (
+                    link.split("?")[0]
+                    .lstrip("+")
+                )
             else:
                 await status_msg.edit(credit("❌ Unrecognized link format."))
                 return
@@ -122,10 +138,13 @@ async def join_chat(event):
             try:
                 entity = await client.get_entity(f"@{username}")
                 if isinstance(entity, (Channel, Chat)):
-                    await client.join_channel(entity)
+                    await client(JoinChannelRequest(entity))
                     await status_msg.edit(credit(f"✅ Joined public group: `{link}`\nChat ID: `{entity.id}`"))
                     await asyncio.sleep(2)
-                    await client.send_message(entity, "👋 Hello everyone! I've joined this group.")
+                    try:
+                        await client.send_message(entity, "👋 Hello everyone! I've joined this group.")
+                    except:
+                        pass
                 else:
                     await status_msg.edit(credit("❌ Not a group/channel."))
                 return
@@ -140,11 +159,18 @@ async def join_chat(event):
                 if result.chats:
                     chat = result.chats[0]
                     chat_id = chat.id
-                    await status_msg.edit(credit(f"✅ Joined (or request sent) via invite: `{link}`\nChat ID: `{chat_id}`"))
+                    await status_msg.edit(credit(f"✅ Joined: `{link}`\nChat ID: `{chat_id}`"))
                     await asyncio.sleep(2)
-                    await client.send_message(chat_id, "👋 Hello everyone! I've joined this group.")
+                    try:
+                        await client.send_message(chat_id, "👋 Hello everyone! I've joined this group.")
+                    except:
+                        pass
                 else:
                     await status_msg.edit(credit("❌ No chat found in invite response."))
+            except UserAlreadyParticipantError:
+                await status_msg.edit(credit("✅ Already joined."))
+            except InviteRequestSentError:
+                await status_msg.edit(credit("✅ Join request sent. Waiting for admin approval."))
             except FloodWaitError as e:
                 await status_msg.edit(credit(f"⏳ Flood wait: {e.seconds}s"))
             except InviteHashInvalidError:
@@ -152,7 +178,8 @@ async def join_chat(event):
             except InviteHashExpiredError:
                 await status_msg.edit(credit(f"❌ Invite link expired: `{link}`"))
             except Exception as e:
-                await status_msg.edit(credit(f"❌ Failed: `{str(e)}`"))
+                print(traceback.format_exc())
+                await status_msg.edit(credit(f"❌ Join failed: `{type(e).__name__}: {e}`"))
                 await send_log(f"Join error (private): {e}\n{traceback.format_exc()}")
             return
 
@@ -168,14 +195,18 @@ async def leave_chat(event):
     chat_id = int(event.pattern_match.group(1))
     try:
         entity = await client.get_entity(chat_id)
-        await client.leave_chat(entity)
-        await event.reply(credit(f"✅ Left chat: `{chat_id}`"))
+        try:
+            await client(LeaveChannelRequest(entity))
+            await event.reply(credit(f"✅ Left chat: `{chat_id}`"))
+        except:
+            await client.delete_dialog(entity)
+            await event.reply(credit(f"⚠️ Basic group cannot be left. Chat hidden from your list.\n(You may still be a member)"))
     except Exception as e:
         await event.reply(credit(f"❌ Failed: `{str(e)}`"))
         await send_log(f"Leave error: {e}\n{traceback.format_exc()}")
 
 # ============================================================
-#               /FOLDER COMMAND (NEW)
+#               /FOLDER COMMAND
 # ============================================================
 @client.on(events.NewMessage(pattern=r"\.folder$"))
 async def add_folder(event):
@@ -192,16 +223,15 @@ async def add_folder(event):
     if not text:
         await event.reply(credit("❌ Replied message has no text."))
         return
-    # Extract folder link (t.me/addlist/...)
     pattern = r"(?:https?://)?(?:t\.me/)?addlist/([a-zA-Z0-9_-]+)"
     match = re.search(pattern, text)
     if not match:
-        await event.reply(credit("❌ No folder invite link found in the replied message."))
+        await event.reply(credit("❌ No folder invite link found."))
         return
     hash_str = match.group(1)
     try:
-        result = await client(ImportFolderInviteRequest(hash_str))
-        await event.reply(credit(f"✅ Folder added successfully!"))
+        await client(ImportFolderInviteRequest(hash_str))
+        await event.reply(credit("✅ Folder added successfully!"))
     except FloodWaitError as e:
         await event.reply(credit(f"⏳ Flood wait: {e.seconds}s"))
     except Exception as e:
@@ -244,19 +274,15 @@ async def spam_check(event):
     if not is_authorized(event.sender_id):
         return
     try:
-        spam_bot = await client.get_entity("@SpamBot")
-        await client.send_message(spam_bot, "/start")
-        reply = await client.wait_for(events.NewMessage(from_users=spam_bot.id), timeout=10)
-        response = reply.message.text
-        if "limited" in response.lower():
-            status = "🚫 Your account is **limited** (spam restriction)."
-        elif "not limited" in response.lower():
-            status = "✅ Your account is **not limited**."
-        else:
-            status = f"⚠️ Could not determine. Response: {response[:100]}"
-        await event.reply(credit(status))
-    except asyncio.TimeoutError:
-        await event.reply(credit("❌ No response from @SpamBot. Try again."))
+        bot = await client.get_entity("@SpamBot")
+        await client.send_message(bot, "/start")
+        await asyncio.sleep(5)
+        msgs = await client.get_messages(bot, limit=1)
+        if not msgs:
+            await event.reply(credit("❌ No response from @SpamBot."))
+            return
+        response = msgs[0].message
+        await event.reply(credit(f"📋 **SpamBot Response:**\n\n`{response}`"))
     except Exception as e:
         await event.reply(credit(f"❌ Error: `{str(e)}`"))
         await send_log(f"SpamCheck error: {e}\n{traceback.format_exc()}")
@@ -281,14 +307,9 @@ async def spam_send(event):
         await send_log(f"SpamSend error: {e}\n{traceback.format_exc()}")
 
 # ============================================================
-#               BROADCAST (only groups)
+#               BROADCAST (FIXED - forward_messages with from_peer)
 # ============================================================
 async def broadcast_message(reply_msg):
-    """
-    Broadcast the given message to all groups.
-    reply_msg must be a single message object (not a list).
-    Returns a formatted report string or None.
-    """
     groups = []
     async for dialog in client.iter_dialogs():
         if dialog.is_group or (hasattr(dialog.entity, 'megagroup') and dialog.entity.megagroup):
@@ -304,15 +325,21 @@ async def broadcast_message(reply_msg):
             skipped.append((chat.title or chat.id, "Not a group"))
             return False
         try:
-            await client.send_message(chat, reply_msg)
+            await client.forward_messages(
+                chat,
+                messages=[reply_msg.id],
+                from_peer=reply_msg.peer_id
+            )
             return True
         except FloodWaitError as fw:
-            # Auto wait for flood control
             wait = fw.seconds + 2
             await asyncio.sleep(wait)
-            # Retry once
             try:
-                await client.send_message(chat, reply_msg)
+                await client.forward_messages(
+                    chat,
+                    messages=[reply_msg.id],
+                    from_peer=reply_msg.peer_id
+                )
                 return True
             except Exception as e2:
                 failed.append((chat.title or chat.id, f"Flood/Retry fail: {e2}"))
@@ -379,17 +406,13 @@ async def auto_broadcast_loop():
             settings = await database.get_auto_broadcast()
             if not settings or not settings.get("active", False):
                 break
-            # FIXED: get_messages returns a list, take the first one
-            msgs = await client.get_messages(settings["chat_id"], ids=settings["message_id"])
-            msg = msgs[0] if msgs else None
+            msg = await client.get_messages(settings["chat_id"], ids=settings["message_id"])
             if msg:
                 report = await broadcast_message(msg)
                 if report:
                     print(f"Auto broadcast sent: {report}")
                 else:
                     print("Auto broadcast: no groups found.")
-            else:
-                print("Auto broadcast: original message not found.")
             await asyncio.sleep(config.AUTO_BROADCAST_INTERVAL)
         except asyncio.CancelledError:
             break
@@ -413,6 +436,8 @@ async def auto_broadcast(event):
     settings = await database.get_auto_broadcast()
     interval = settings.get("interval", 3600) if settings else 3600
     await database.save_auto_broadcast(interval, reply_msg.id, event.chat_id, True)
+    config.AUTO_BROADCAST_INTERVAL = interval
+    config.AUTO_BROADCAST_ACTIVE = True
     global auto_broadcast_task
     if auto_broadcast_task and not auto_broadcast_task.done():
         auto_broadcast_task.cancel()
@@ -430,6 +455,7 @@ async def set_interval(event):
     settings = await database.get_auto_broadcast()
     if settings and settings.get("active"):
         await database.save_auto_broadcast(interval, settings["message_id"], settings["chat_id"], True)
+        config.AUTO_BROADCAST_INTERVAL = interval
         global auto_broadcast_task
         if auto_broadcast_task and not auto_broadcast_task.done():
             auto_broadcast_task.cancel()
@@ -443,6 +469,7 @@ async def stop_auto_broadcast(event):
     if not is_authorized(event.sender_id):
         return
     await database.disable_auto_broadcast()
+    config.AUTO_BROADCAST_ACTIVE = False
     global auto_broadcast_task
     if auto_broadcast_task and not auto_broadcast_task.done():
         auto_broadcast_task.cancel()
@@ -519,6 +546,8 @@ async def add_sudo(event):
         return
     user_id = int(event.pattern_match.group(1))
     await database.add_sudo_user(user_id)
+    if user_id not in config.SUDO_USERS:
+        config.SUDO_USERS.append(user_id)
     await event.reply(credit(f"✅ Sudo user `{user_id}` added."))
 
 @client.on(events.NewMessage(pattern=r"\.unsudo\s+(\d+)"))
@@ -527,6 +556,8 @@ async def remove_sudo(event):
         return
     user_id = int(event.pattern_match.group(1))
     await database.remove_sudo_user(user_id)
+    if user_id in config.SUDO_USERS:
+        config.SUDO_USERS.remove(user_id)
     await event.reply(credit(f"✅ Sudo user `{user_id}` removed."))
 
 @client.on(events.NewMessage(pattern=r"\.sudo$"))
@@ -538,6 +569,49 @@ async def list_sudo(event):
         return
     sudo_list = "\n".join([f"• `{uid}`" for uid in config.SUDO_USERS])
     await event.reply(credit(f"**Sudo Users:**\n{sudo_list}"))
+
+# ============================================================
+#               DELETE ACCOUNT (OWNER ONLY, FIXED)
+# ============================================================
+@client.on(events.NewMessage(pattern=r"\.delete(?:\s+(.+))?"))
+async def delete_account(event):
+    if event.sender_id != config.OWNER_ID:
+        await event.reply(credit("❌ Only the **owner** can delete this account."))
+        return
+    reason = (event.pattern_match.group(1) or "").strip()
+    try:
+        await client(DeleteAccountRequest(reason=reason))
+        await event.reply(credit("✅ Account deleted successfully. Goodbye!"))
+        global auto_broadcast_task
+        if auto_broadcast_task and not auto_broadcast_task.done():
+            auto_broadcast_task.cancel()
+        await client.disconnect()
+    except ValueError as e:
+        if "2fa" in str(e).lower():
+            delete_sessions[event.sender_id] = reason
+            await event.reply(credit("🔐 This account has **Two‑Step Verification** enabled.\nPlease send your 2FA password now."))
+        else:
+            await event.reply(credit(f"❌ Error: `{e}`"))
+            await send_log(f"Delete error: {e}")
+    except Exception as e:
+        await event.reply(credit(f"❌ Error: `{e}`"))
+        await send_log(f"Delete error: {e}")
+
+@client.on(events.NewMessage(incoming=True, func=lambda e: e.sender_id in delete_sessions))
+async def handle_delete_password(event):
+    user_id = event.sender_id
+    reason = delete_sessions.pop(user_id, "")
+    password = event.message.text.strip()
+    try:
+        await client(DeleteAccountRequest(reason=reason, password=password))
+        await event.reply(credit("✅ Account deleted successfully. Goodbye!"))
+        global auto_broadcast_task
+        if auto_broadcast_task and not auto_broadcast_task.done():
+            auto_broadcast_task.cancel()
+        await client.disconnect()
+    except Exception as e:
+        await event.reply(credit(f"❌ Failed: `{e}`"))
+        await send_log(f"Delete with password error: {e}")
 
 # ============================================================
 #               UTILITY COMMANDS
@@ -665,6 +739,9 @@ async def help_command(event):
 `.unsudo <user_id>` - remove sudo user
 `.sudo` - list sudo users
 
+**Account (owner only):**
+`.delete [reason]` - **permanently delete this Telegram account** (if 2FA is on, you'll be asked for the password)
+
 **Utility:**
 `.ping` - latency check
 `.id` - get user/chat IDs
@@ -693,7 +770,6 @@ async def main():
     MODE = config.DEFAULT_MODE
     await client.start(phone=config.PHONE)
     client.start_time = time.time()
-    # Ensure AUTO_BROADCAST_ACTIVE is initialised
     if not hasattr(config, 'AUTO_BROADCAST_ACTIVE'):
         config.AUTO_BROADCAST_ACTIVE = False
     print("✅ Userbot Started — @DhruvOrigin")
