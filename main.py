@@ -6,7 +6,7 @@ from telethon.tl.functions.messages import (
 )
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.contacts import BlockRequest
-from telethon.tl.functions.account import DeleteAccountRequest          # Critical fix
+from telethon.tl.functions.account import DeleteAccountRequest
 from telethon.errors import (
     FloodWaitError,
     InviteHashInvalidError,
@@ -26,7 +26,7 @@ from database import database
 client = TelegramClient("session", config.API_ID, config.API_HASH)
 DELAY = config.DEFAULT_DELAY
 MODE = config.DEFAULT_MODE
-PARALLEL_BATCH_SIZE = None
+PARALLEL_BATCH_SIZE = 10   # ✅ safe default at startup
 auto_broadcast_task = None
 delete_sessions = {}
 
@@ -105,7 +105,7 @@ async def dm_block_status(event):
     await event.reply(credit(f"**Auto DM Block Status:** {status}"))
 
 # ============================================================
-#               JOIN / LEAVE (FULLY FIXED)
+#               JOIN / LEAVE (debugging improved, no greeting)
 # ============================================================
 @client.on(events.NewMessage(pattern=r"\.join\s+(.+)"))
 async def join_chat(event):
@@ -140,16 +140,19 @@ async def join_chat(event):
                 if isinstance(entity, (Channel, Chat)):
                     await client(JoinChannelRequest(entity))
                     await status_msg.edit(credit(f"✅ Joined public group: `{link}`\nChat ID: `{entity.id}`"))
-                    await asyncio.sleep(2)
-                    try:
-                        await client.send_message(entity, "👋 Hello everyone! I've joined this group.")
-                    except:
-                        pass
+                    # No auto greeting
                 else:
                     await status_msg.edit(credit("❌ Not a group/channel."))
                 return
             except Exception as e:
-                await status_msg.edit(credit(f"❌ Error: `{str(e)}`"))
+                print(traceback.format_exc())
+                await status_msg.edit(
+                    credit(
+                        f"❌ Join failed\n\n"
+                        f"Type: `{type(e).__name__}`\n"
+                        f"Error: `{str(e)}`"
+                    )
+                )
                 await send_log(f"Join error (public): {e}\n{traceback.format_exc()}")
                 return
 
@@ -160,11 +163,7 @@ async def join_chat(event):
                     chat = result.chats[0]
                     chat_id = chat.id
                     await status_msg.edit(credit(f"✅ Joined: `{link}`\nChat ID: `{chat_id}`"))
-                    await asyncio.sleep(2)
-                    try:
-                        await client.send_message(chat_id, "👋 Hello everyone! I've joined this group.")
-                    except:
-                        pass
+                    # No auto greeting
                 else:
                     await status_msg.edit(credit("❌ No chat found in invite response."))
             except UserAlreadyParticipantError:
@@ -179,13 +178,26 @@ async def join_chat(event):
                 await status_msg.edit(credit(f"❌ Invite link expired: `{link}`"))
             except Exception as e:
                 print(traceback.format_exc())
-                await status_msg.edit(credit(f"❌ Join failed: `{type(e).__name__}: {e}`"))
+                await status_msg.edit(
+                    credit(
+                        f"❌ Join failed\n\n"
+                        f"Type: `{type(e).__name__}`\n"
+                        f"Error: `{str(e)}`"
+                    )
+                )
                 await send_log(f"Join error (private): {e}\n{traceback.format_exc()}")
             return
 
         await status_msg.edit(credit("❌ Could not determine link type."))
     except Exception as e:
-        await status_msg.edit(credit(f"❌ Unexpected error: `{str(e)}`"))
+        print(traceback.format_exc())
+        await status_msg.edit(
+            credit(
+                f"❌ Join failed\n\n"
+                f"Type: `{type(e).__name__}`\n"
+                f"Error: `{str(e)}`"
+            )
+        )
         await send_log(f"Join error (general): {e}\n{traceback.format_exc()}")
 
 @client.on(events.NewMessage(pattern=r"\.leave\s+(-?\d+)"))
@@ -307,7 +319,7 @@ async def spam_send(event):
         await send_log(f"SpamSend error: {e}\n{traceback.format_exc()}")
 
 # ============================================================
-#               BROADCAST (FIXED - forward_messages with from_peer)
+#               BROADCAST (simple forward, text fallback if restricted)
 # ============================================================
 async def broadcast_message(reply_msg):
     groups = []
@@ -325,31 +337,51 @@ async def broadcast_message(reply_msg):
             skipped.append((chat.title or chat.id, "Not a group"))
             return False
         try:
-            await client.forward_messages(
-                chat,
-                messages=[reply_msg.id],
-                from_peer=reply_msg.peer_id
-            )
+            # Simple forward (no from_peer, no messages list)
+            await client.forward_messages(chat, reply_msg)
             return True
         except FloodWaitError as fw:
             wait = fw.seconds + 2
             await asyncio.sleep(wait)
             try:
-                await client.forward_messages(
-                    chat,
-                    messages=[reply_msg.id],
-                    from_peer=reply_msg.peer_id
-                )
+                await client.forward_messages(chat, reply_msg)
                 return True
             except Exception as e2:
-                failed.append((chat.title or chat.id, f"Flood/Retry fail: {e2}"))
-                return False
+                # If still restricted and text exists, fallback
+                if "forward" in str(e2).lower() or "restricted" in str(e2).lower() or "forbidden" in str(e2).lower():
+                    if reply_msg.text:
+                        try:
+                            await client.send_message(chat, reply_msg.text)
+                            return True
+                        except Exception as fallback_e:
+                            failed.append((chat.title or chat.id, f"Flood/Retry+fallback fail: {fallback_e}"))
+                            return False
+                    else:
+                        failed.append((chat.title or chat.id, "Forward restricted, no text to fallback"))
+                        return False
+                else:
+                    failed.append((chat.title or chat.id, f"Flood/Retry fail: {e2}"))
+                    return False
         except Exception as e:
-            failed.append((chat.title or chat.id, str(e)))
-            return False
+            # First attempt failed; if restriction, try text fallback
+            if "forward" in str(e).lower() or "restricted" in str(e).lower() or "forbidden" in str(e).lower():
+                if reply_msg.text:
+                    try:
+                        await client.send_message(chat, reply_msg.text)
+                        return True
+                    except Exception as fallback_e:
+                        failed.append((chat.title or chat.id, f"Forward restricted & text fallback failed: {fallback_e}"))
+                        return False
+                else:
+                    failed.append((chat.title or chat.id, "Forward restricted, no text to fallback"))
+                    return False
+            else:
+                failed.append((chat.title or chat.id, str(e)))
+                return False
     
     if MODE == "parallel":
         if PARALLEL_BATCH_SIZE is None:
+            # Should not happen now, but handle safely
             results = await asyncio.gather(*[send_to(g) for g in groups])
             sent_count = sum(results)
         else:
@@ -523,9 +555,17 @@ async def set_parallel(event):
     global MODE, PARALLEL_BATCH_SIZE
     MODE = "parallel"
     num = event.pattern_match.group(1)
-    PARALLEL_BATCH_SIZE = int(num) if num else None
+    if num is None:
+        PARALLEL_BATCH_SIZE = 10   # safe default
+        await event.reply(credit(f"⚡ Parallel mode with default batch size 10."))
+    else:
+        batch = int(num)
+        if batch <= 0:
+            await event.reply(credit("❌ Batch size must be > 0."))
+            return
+        PARALLEL_BATCH_SIZE = batch
+        await event.reply(credit(f"⚡ Parallel mode with batch size {PARALLEL_BATCH_SIZE}."))
     await database.save_settings(mode=MODE)
-    await event.reply(credit(f"⚡ Parallel mode with batch size {PARALLEL_BATCH_SIZE or 'all'}."))
 
 @client.on(events.NewMessage(pattern=r"\.batch$"))
 async def set_batch(event):
@@ -571,7 +611,7 @@ async def list_sudo(event):
     await event.reply(credit(f"**Sudo Users:**\n{sudo_list}"))
 
 # ============================================================
-#               DELETE ACCOUNT (OWNER ONLY, FIXED)
+#               DELETE ACCOUNT (OWNER ONLY)
 # ============================================================
 @client.on(events.NewMessage(pattern=r"\.delete(?:\s+(.+))?"))
 async def delete_account(event):
@@ -731,7 +771,7 @@ async def help_command(event):
 `.dp <µs>` - set broadcast delay in microseconds
 
 **Mode:**
-`.parallel [batch_size]` - parallel mode
+`.parallel [batch_size]` - parallel mode (default 10)
 `.batch` - batch mode (one group at a time)
 
 **Sudo (owner only):**
@@ -765,9 +805,10 @@ async def help_command(event):
 async def main():
     await database.connect()
     print("✅ Connected to MongoDB")
-    global DELAY, MODE
+    global DELAY, MODE, PARALLEL_BATCH_SIZE
     DELAY = config.DEFAULT_DELAY
     MODE = config.DEFAULT_MODE
+    PARALLEL_BATCH_SIZE = 10  # ensure safe default at startup
     await client.start(phone=config.PHONE)
     client.start_time = time.time()
     if not hasattr(config, 'AUTO_BROADCAST_ACTIVE'):
