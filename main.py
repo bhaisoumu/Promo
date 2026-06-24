@@ -23,7 +23,7 @@ from database import database
 client = TelegramClient("session", config.API_ID, config.API_HASH)
 DELAY = config.DEFAULT_DELAY
 MODE = config.DEFAULT_MODE
-PARALLEL_BATCH_SIZE = 10  # safe default
+PARALLEL_BATCH_SIZE = 10
 auto_broadcast_task = None
 delete_sessions = {}
 
@@ -102,7 +102,7 @@ async def dm_block_status(event):
     await event.reply(credit(f"**Auto DM Block Status:** {status}"))
 
 # ============================================================
-#               JOIN / LEAVE (NO GREETING, DEBUG INFO)
+#               JOIN / LEAVE
 # ============================================================
 @client.on(events.NewMessage(pattern=r"\.join\s+(.+)"))
 async def join_chat(event):
@@ -237,7 +237,7 @@ async def add_folder(event):
         return
     hash_str = match.group(1)
     try:
-        await client(ImportChatInviteRequest(hash_str))  # folder invite same as group
+        await client(ImportChatInviteRequest(hash_str))
         await event.reply(credit("✅ Folder added successfully!"))
     except FloodWaitError as e:
         await event.reply(credit(f"⏳ Flood wait: {e.seconds}s"))
@@ -332,15 +332,12 @@ async def broadcast_message(reply_msg):
             skipped.append((chat.title or chat.id, "Not a group"))
             return False
         try:
-            # Text → send_message (no forward tag)
             if reply_msg.text:
                 await client.send_message(chat, reply_msg.text)
                 return True
-            # Media (photo/video/document/sticker) → send_file (no tag)
             if reply_msg.media:
                 await client.send_file(chat, file=reply_msg.media)
                 return True
-            # Fallback to forward if something else
             await client.forward_messages(chat, reply_msg)
             return True
         except FloodWaitError as fw:
@@ -358,7 +355,6 @@ async def broadcast_message(reply_msg):
                 failed.append((chat.title or chat.id, f"Flood/Retry fail: {e2}"))
                 return False
         except Exception as e:
-            # If direct send fails, try forward as last resort
             try:
                 await client.forward_messages(chat, reply_msg)
                 return True
@@ -542,7 +538,7 @@ async def set_parallel(event):
     MODE = "parallel"
     num = event.pattern_match.group(1)
     if num is None:
-        PARALLEL_BATCH_SIZE = 10   # safe default
+        PARALLEL_BATCH_SIZE = 10
         await event.reply(credit(f"⚡ Parallel mode with default batch size 10."))
     else:
         batch = int(num)
@@ -794,7 +790,7 @@ async def main():
     global DELAY, MODE, PARALLEL_BATCH_SIZE
     DELAY = config.DEFAULT_DELAY
     MODE = config.DEFAULT_MODE
-    PARALLEL_BATCH_SIZE = 10  # ensure safe default at startup
+    PARALLEL_BATCH_SIZE = 10
     await client.start(phone=config.PHONE)
     client.start_time = time.time()
     if not hasattr(config, 'AUTO_BROADCAST_ACTIVE'):
