@@ -1,9 +1,6 @@
 from telethon import TelegramClient, events
 from telethon.tl.types import User, Chat, Channel
-from telethon.tl.functions.messages import (
-    ImportChatInviteRequest,
-    ImportFolderInviteRequest,
-)
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.account import DeleteAccountRequest
@@ -26,7 +23,7 @@ from database import database
 client = TelegramClient("session", config.API_ID, config.API_HASH)
 DELAY = config.DEFAULT_DELAY
 MODE = config.DEFAULT_MODE
-PARALLEL_BATCH_SIZE = 10   # ✅ safe default at startup
+PARALLEL_BATCH_SIZE = 10  # safe default
 auto_broadcast_task = None
 delete_sessions = {}
 
@@ -105,7 +102,7 @@ async def dm_block_status(event):
     await event.reply(credit(f"**Auto DM Block Status:** {status}"))
 
 # ============================================================
-#               JOIN / LEAVE (debugging improved, no greeting)
+#               JOIN / LEAVE (NO GREETING, DEBUG INFO)
 # ============================================================
 @client.on(events.NewMessage(pattern=r"\.join\s+(.+)"))
 async def join_chat(event):
@@ -140,7 +137,6 @@ async def join_chat(event):
                 if isinstance(entity, (Channel, Chat)):
                     await client(JoinChannelRequest(entity))
                     await status_msg.edit(credit(f"✅ Joined public group: `{link}`\nChat ID: `{entity.id}`"))
-                    # No auto greeting
                 else:
                     await status_msg.edit(credit("❌ Not a group/channel."))
                 return
@@ -163,7 +159,6 @@ async def join_chat(event):
                     chat = result.chats[0]
                     chat_id = chat.id
                     await status_msg.edit(credit(f"✅ Joined: `{link}`\nChat ID: `{chat_id}`"))
-                    # No auto greeting
                 else:
                     await status_msg.edit(credit("❌ No chat found in invite response."))
             except UserAlreadyParticipantError:
@@ -242,7 +237,7 @@ async def add_folder(event):
         return
     hash_str = match.group(1)
     try:
-        await client(ImportFolderInviteRequest(hash_str))
+        await client(ImportChatInviteRequest(hash_str))  # folder invite same as group
         await event.reply(credit("✅ Folder added successfully!"))
     except FloodWaitError as e:
         await event.reply(credit(f"⏳ Flood wait: {e.seconds}s"))
@@ -319,7 +314,7 @@ async def spam_send(event):
         await send_log(f"SpamSend error: {e}\n{traceback.format_exc()}")
 
 # ============================================================
-#               BROADCAST (simple forward, text fallback if restricted)
+#               BROADCAST (NO FORWARD TAG)
 # ============================================================
 async def broadcast_message(reply_msg):
     groups = []
@@ -337,51 +332,42 @@ async def broadcast_message(reply_msg):
             skipped.append((chat.title or chat.id, "Not a group"))
             return False
         try:
-            # Simple forward (no from_peer, no messages list)
+            # Text → send_message (no forward tag)
+            if reply_msg.text:
+                await client.send_message(chat, reply_msg.text)
+                return True
+            # Media (photo/video/document/sticker) → send_file (no tag)
+            if reply_msg.media:
+                await client.send_file(chat, file=reply_msg.media)
+                return True
+            # Fallback to forward if something else
             await client.forward_messages(chat, reply_msg)
             return True
         except FloodWaitError as fw:
             wait = fw.seconds + 2
             await asyncio.sleep(wait)
             try:
-                await client.forward_messages(chat, reply_msg)
+                if reply_msg.text:
+                    await client.send_message(chat, reply_msg.text)
+                elif reply_msg.media:
+                    await client.send_file(chat, file=reply_msg.media)
+                else:
+                    await client.forward_messages(chat, reply_msg)
                 return True
             except Exception as e2:
-                # If still restricted and text exists, fallback
-                if "forward" in str(e2).lower() or "restricted" in str(e2).lower() or "forbidden" in str(e2).lower():
-                    if reply_msg.text:
-                        try:
-                            await client.send_message(chat, reply_msg.text)
-                            return True
-                        except Exception as fallback_e:
-                            failed.append((chat.title or chat.id, f"Flood/Retry+fallback fail: {fallback_e}"))
-                            return False
-                    else:
-                        failed.append((chat.title or chat.id, "Forward restricted, no text to fallback"))
-                        return False
-                else:
-                    failed.append((chat.title or chat.id, f"Flood/Retry fail: {e2}"))
-                    return False
+                failed.append((chat.title or chat.id, f"Flood/Retry fail: {e2}"))
+                return False
         except Exception as e:
-            # First attempt failed; if restriction, try text fallback
-            if "forward" in str(e).lower() or "restricted" in str(e).lower() or "forbidden" in str(e).lower():
-                if reply_msg.text:
-                    try:
-                        await client.send_message(chat, reply_msg.text)
-                        return True
-                    except Exception as fallback_e:
-                        failed.append((chat.title or chat.id, f"Forward restricted & text fallback failed: {fallback_e}"))
-                        return False
-                else:
-                    failed.append((chat.title or chat.id, "Forward restricted, no text to fallback"))
-                    return False
-            else:
-                failed.append((chat.title or chat.id, str(e)))
+            # If direct send fails, try forward as last resort
+            try:
+                await client.forward_messages(chat, reply_msg)
+                return True
+            except Exception as fe:
+                failed.append((chat.title or chat.id, f"Send failed: {e}, forward fallback: {fe}"))
                 return False
     
     if MODE == "parallel":
         if PARALLEL_BATCH_SIZE is None:
-            # Should not happen now, but handle safely
             results = await asyncio.gather(*[send_to(g) for g in groups])
             sent_count = sum(results)
         else:
