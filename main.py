@@ -3,7 +3,7 @@ from telethon.tl.types import User, Chat, Channel
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.contacts import BlockRequest
-from telethon.tl.functions.account import DeleteAccountRequest
+from telethon.tl.functions.account import DeleteAccountRequest, UpdateProfileRequest
 from telethon.errors import (
     FloodWaitError,
     InviteHashInvalidError,
@@ -15,6 +15,7 @@ import asyncio
 import time
 import traceback
 import re
+import random
 from datetime import timedelta
 from config import config
 from database import database
@@ -26,6 +27,18 @@ MODE = config.DEFAULT_MODE
 PARALLEL_BATCH_SIZE = 10
 auto_broadcast_task = None
 delete_sessions = {}
+
+# Super broadcast globals
+SAVED_MESSAGES = []
+BATCH_SIZE = 10
+current_msg_index = 0
+
+# Flood bypass globals
+INVISIBLE_CHARS_ON = False
+RANDOM_DELAY_ON = False
+TYPING_SIMULATION_ON = False
+DELAY_MIN = 5
+DELAY_MAX = 15
 
 # --- LOGGING ---
 async def send_log(text: str):
@@ -246,7 +259,7 @@ async def add_folder(event):
         await send_log(f"Folder error: {e}\n{traceback.format_exc()}")
 
 # ============================================================
-#               /BIO COMMAND
+#               /BIO COMMAND (FIXED)
 # ============================================================
 @client.on(events.NewMessage(pattern=r"^/bio$"))
 async def set_bio(event):
@@ -267,7 +280,7 @@ async def set_bio(event):
         if len(new_bio) > 70:
             new_bio = new_bio[:70]
             await event.reply(credit(f"⚠️ Bio trimmed to 70 characters."))
-        await client.edit_profile(about=new_bio)
+        await client(UpdateProfileRequest(about=new_bio))
         await event.reply(credit(f"✅ Bio updated to:\n\n`{new_bio}`"))
     except Exception as e:
         await event.reply(credit(f"❌ Failed to update bio: `{str(e)}`"))
@@ -314,7 +327,208 @@ async def spam_send(event):
         await send_log(f"SpamSend error: {e}\n{traceback.format_exc()}")
 
 # ============================================================
-#               BROADCAST (NO FORWARD TAG)
+#               SUPER BROADCAST SYSTEM
+# ============================================================
+@client.on(events.NewMessage(pattern=r"\.setmsg\s+(.+)"))
+async def set_message(event):
+    if not is_authorized(event.sender_id):
+        return
+    text = event.pattern_match.group(1).strip()
+    SAVED_MESSAGES.append({"text": text})
+    preview = text[:50] + "..." if len(text) > 50 else text
+    await event.reply(credit(f"✅ Message #{len(SAVED_MESSAGES)} saved:\n`{preview}`"))
+
+@client.on(events.NewMessage(pattern=r"\.delmsg\s+(\d+)"))
+async def delete_message(event):
+    if not is_authorized(event.sender_id):
+        return
+    idx = int(event.pattern_match.group(1)) - 1
+    if 0 <= idx < len(SAVED_MESSAGES):
+        removed = SAVED_MESSAGES.pop(idx)
+        preview = removed['text'][:50] + "..." if len(removed['text']) > 50 else removed['text']
+        await event.reply(credit(f"✅ Message #{idx+1} deleted:\n`{preview}`"))
+    else:
+        await event.reply(credit(f"❌ Invalid index. Use 1-{len(SAVED_MESSAGES)}"))
+
+@client.on(events.NewMessage(pattern=r"\.listmsg$"))
+async def list_messages(event):
+    if not is_authorized(event.sender_id):
+        return
+    if not SAVED_MESSAGES:
+        await event.reply(credit("ℹ️ No saved messages."))
+        return
+    msg_list = "\n".join([
+        f"#{i+1}: `{m['text'][:40]}...`" if len(m['text']) > 40 else f"#{i+1}: `{m['text']}`"
+        for i, m in enumerate(SAVED_MESSAGES)
+    ])
+    await event.reply(credit(f"**Saved Messages ({len(SAVED_MESSAGES)}):**\n{msg_list}"))
+
+@client.on(events.NewMessage(pattern=r"\.clearmsg$"))
+async def clear_messages(event):
+    if not is_authorized(event.sender_id):
+        return
+    global SAVED_MESSAGES, current_msg_index
+    count = len(SAVED_MESSAGES)
+    SAVED_MESSAGES = []
+    current_msg_index = 0
+    await event.reply(credit(f"✅ Cleared {count} messages."))
+
+@client.on(events.NewMessage(pattern=r"\.setbatch\s+(\d+)"))
+async def set_batch_size(event):
+    if not is_authorized(event.sender_id):
+        return
+    global BATCH_SIZE
+    size = int(event.pattern_match.group(1))
+    if size < 1:
+        await event.reply(credit("❌ Batch size must be at least 1."))
+        return
+    BATCH_SIZE = size
+    await event.reply(credit(f"✅ Batch size set to {BATCH_SIZE} groups per message."))
+
+async def super_broadcast():
+    if not SAVED_MESSAGES:
+        return "❌ No messages saved. Use `.setmsg` first."
+    groups = []
+    async for dialog in client.iter_dialogs():
+        if dialog.is_group or (hasattr(dialog.entity, 'megagroup') and dialog.entity.megagroup):
+            groups.append(dialog.entity)
+    if not groups:
+        return "⚠️ No groups found."
+    global current_msg_index
+    sent_count = 0
+    failed = []
+    skipped = []
+
+    async def send_to(chat, msg_text):
+        if not is_group(chat):
+            skipped.append((chat.title or chat.id, "Not a group"))
+            return False
+        try:
+            if TYPING_SIMULATION_ON:
+                await client.action(chat, 'typing')
+                await asyncio.sleep(random.uniform(0.3, 1.0))
+            if INVISIBLE_CHARS_ON:
+                invisible_chars = ["\u200b", "\u200c", "\u200d", "\u2060", "\uFEFF"]
+                pos = random.randint(0, len(msg_text))
+                msg_text = msg_text[:pos] + random.choice(invisible_chars) + msg_text[pos:]
+            await client.send_message(chat, msg_text)
+            return True
+        except FloodWaitError as fw:
+            wait = fw.seconds + 2
+            await asyncio.sleep(wait)
+            try:
+                await client.send_message(chat, msg_text)
+                return True
+            except Exception as e2:
+                failed.append((chat.title or chat.id, f"Flood/Retry fail: {e2}"))
+                return False
+        except Exception as e:
+            failed.append((chat.title or chat.id, str(e)))
+            return False
+
+    for i in range(0, len(groups), BATCH_SIZE):
+        batch = groups[i:i + BATCH_SIZE]
+        if current_msg_index >= len(SAVED_MESSAGES):
+            current_msg_index = 0
+        msg_text = SAVED_MESSAGES[current_msg_index]["text"]
+        tasks = [send_to(g, msg_text) for g in batch]
+        results = await asyncio.gather(*tasks)
+        sent_count += sum(results)
+        current_msg_index = (current_msg_index + 1) % len(SAVED_MESSAGES)
+        if i + BATCH_SIZE < len(groups):
+            sleep_time = random.randint(DELAY_MIN, DELAY_MAX) if RANDOM_DELAY_ON else DELAY
+            await asyncio.sleep(sleep_time)
+
+    report = f"✅ **{sent_count}/{len(groups)}** groups received messages.\n"
+    report += f"📝 Messages used: {len(SAVED_MESSAGES)} | Batch size: {BATCH_SIZE}"
+    if skipped:
+        skip_list = "\n".join([f"• {name}: `{reason}`" for name, reason in skipped[:3]])
+        report += f"\n⚠️ **{len(skipped)}** skipped:\n{skip_list}"
+    if failed:
+        fail_list = "\n".join([f"• {name}: `{err}`" for name, err in failed[:5]])
+        report += f"\n❌ **{len(failed)}** failed:\n{fail_list}"
+    return report
+
+@client.on(events.NewMessage(pattern=r"\.sb$"))
+async def super_broadcast_command(event):
+    if not is_authorized(event.sender_id):
+        return
+    if not SAVED_MESSAGES:
+        await event.reply(credit("❌ No saved messages. Use `.setmsg` first."))
+        return
+    status_msg = await event.reply("📤 Super Broadcasting with rotation...")
+    try:
+        report = await super_broadcast()
+        await status_msg.edit(credit(report))
+    except Exception as e:
+        await status_msg.edit(credit(f"❌ Super Broadcast error: `{str(e)}`"))
+        await send_log(f"Super Broadcast error: {e}\n{traceback.format_exc()}")
+
+# ============================================================
+#               FLOOD BYPASS COMMANDS
+# ============================================================
+@client.on(events.NewMessage(pattern=r"\.bypass\s+(on|off)$"))
+async def bypass_toggle(event):
+    if not is_authorized(event.sender_id):
+        return
+    global INVISIBLE_CHARS_ON, RANDOM_DELAY_ON, TYPING_SIMULATION_ON, DELAY_MIN, DELAY_MAX
+    cmd = event.pattern_match.group(1)
+    if cmd == "on":
+        INVISIBLE_CHARS_ON = True
+        RANDOM_DELAY_ON = True
+        TYPING_SIMULATION_ON = True
+        DELAY_MIN = 7
+        DELAY_MAX = 12
+        await event.reply(credit("✅ Flood bypass ON (invisible chars + random delay 7–12s + typing simulation)"))
+    else:
+        INVISIBLE_CHARS_ON = False
+        RANDOM_DELAY_ON = False
+        TYPING_SIMULATION_ON = False
+        await event.reply(credit("✅ Flood bypass OFF"))
+
+@client.on(events.NewMessage(pattern=r"\.invis\s+(on|off)$"))
+async def invis_toggle(event):
+    if not is_authorized(event.sender_id):
+        return
+    global INVISIBLE_CHARS_ON
+    cmd = event.pattern_match.group(1)
+    INVISIBLE_CHARS_ON = (cmd == "on")
+    status = "ON" if INVISIBLE_CHARS_ON else "OFF"
+    await event.reply(credit(f"✅ Invisible characters {status}"))
+
+@client.on(events.NewMessage(pattern=r"\.typing\s+(on|off)$"))
+async def typing_toggle(event):
+    if not is_authorized(event.sender_id):
+        return
+    global TYPING_SIMULATION_ON
+    cmd = event.pattern_match.group(1)
+    TYPING_SIMULATION_ON = (cmd == "on")
+    status = "ON" if TYPING_SIMULATION_ON else "OFF"
+    await event.reply(credit(f"✅ Typing simulation {status}"))
+
+@client.on(events.NewMessage(pattern=r"\.rnddelay\s+(\d+)\s+(\d+)"))
+async def set_random_delay_custom(event):
+    if not is_authorized(event.sender_id):
+        return
+    global RANDOM_DELAY_ON, DELAY_MIN, DELAY_MAX
+    DELAY_MIN = int(event.pattern_match.group(1))
+    DELAY_MAX = int(event.pattern_match.group(2))
+    if DELAY_MIN > DELAY_MAX or DELAY_MIN < 1:
+        await event.reply(credit("❌ Min should be less than max and > 0."))
+        return
+    RANDOM_DELAY_ON = True
+    await event.reply(credit(f"✅ Random delay ON: {DELAY_MIN}s–{DELAY_MAX}s"))
+
+@client.on(events.NewMessage(pattern=r"\.rnddelay\s+off$"))
+async def set_random_delay_off(event):
+    if not is_authorized(event.sender_id):
+        return
+    global RANDOM_DELAY_ON
+    RANDOM_DELAY_ON = False
+    await event.reply(credit("✅ Random delay OFF"))
+
+# ============================================================
+#               STANDARD BROADCAST (NO FORWARD TAG)
 # ============================================================
 async def broadcast_message(reply_msg):
     groups = []
@@ -332,8 +546,16 @@ async def broadcast_message(reply_msg):
             skipped.append((chat.title or chat.id, "Not a group"))
             return False
         try:
+            if TYPING_SIMULATION_ON:
+                await client.action(chat, 'typing')
+                await asyncio.sleep(random.uniform(0.3, 1.0))
             if reply_msg.text:
-                await client.send_message(chat, reply_msg.text)
+                msg_text = reply_msg.text
+                if INVISIBLE_CHARS_ON:
+                    invisible_chars = ["\u200b", "\u200c", "\u200d", "\u2060", "\uFEFF"]
+                    pos = random.randint(0, len(msg_text))
+                    msg_text = msg_text[:pos] + random.choice(invisible_chars) + msg_text[pos:]
+                await client.send_message(chat, msg_text)
                 return True
             if reply_msg.media:
                 await client.send_file(chat, file=reply_msg.media)
@@ -372,13 +594,15 @@ async def broadcast_message(reply_msg):
                 results = await asyncio.gather(*[send_to(g) for g in batch])
                 sent_count += sum(results)
                 if i + PARALLEL_BATCH_SIZE < len(groups):
-                    await asyncio.sleep(DELAY)
+                    sleep_time = random.randint(DELAY_MIN, DELAY_MAX) if RANDOM_DELAY_ON else DELAY
+                    await asyncio.sleep(sleep_time)
     else:
         for i, group in enumerate(groups):
             if await send_to(group):
                 sent_count += 1
             if i < len(groups) - 1:
-                await asyncio.sleep(DELAY)
+                sleep_time = random.randint(DELAY_MIN, DELAY_MAX) if RANDOM_DELAY_ON else DELAY
+                await asyncio.sleep(sleep_time)
     
     report = f"✅ **{sent_count}/{len(groups)}** groups received the message."
     if skipped:
@@ -722,6 +946,14 @@ async def help_command(event):
     help_text = f"""
 **📚 Available Commands:**
 
+**Super Broadcast (Rotating Messages):**
+`.setmsg <text>` - save a message for rotation
+`.delmsg <index>` - delete a saved message
+`.listmsg` - list all saved messages
+`.clearmsg` - clear all saved messages
+`.setbatch <N>` - set groups per message (default 10)
+`.sb` - **Super Broadcast** with rotating messages
+
 **Broadcast:**
 `.b` - broadcast replied message to **groups only**
 `.ab` - set auto broadcast (reply to a message)
@@ -764,6 +996,14 @@ async def help_command(event):
 **Account (owner only):**
 `.delete [reason]` - **permanently delete this Telegram account** (if 2FA is on, you'll be asked for the password)
 
+**Flood Bypass Controls:**
+`.bypass on` - enable invisible chars + random delay 7–12s + typing simulation
+`.bypass off` - disable all bypass features
+`.invis on/off` - toggle invisible characters only
+`.typing on/off` - toggle typing simulation
+`.rnddelay <min> <max>` - enable random delay with custom range
+`.rnddelay off` - disable random delay
+
 **Utility:**
 `.ping` - latency check
 `.id` - get user/chat IDs
@@ -776,6 +1016,9 @@ async def help_command(event):
 • Delay: `{DELAY}s`
 • DM Block: `{'Active' if config.AUTO_DM_BLOCK else 'Inactive'}`
 • Auto Broadcast: `{'Active' if config.AUTO_BROADCAST_ACTIVE else 'Inactive'}`
+• Invisible chars: `{'ON' if INVISIBLE_CHARS_ON else 'OFF'}`
+• Random delay: `{'ON (' + str(DELAY_MIN) + '–' + str(DELAY_MAX) + 's)' if RANDOM_DELAY_ON else 'OFF'}`
+• Typing simulation: `{'ON' if TYPING_SIMULATION_ON else 'OFF'}`
 
 ⚠️ Broadcasts only go to **groups**, never to channels or DMs.
 """
